@@ -1,3 +1,4 @@
+import assert from "assert";
 import fs from "fs";
 import { DonNode } from "@prokopschield/don";
 import { contentType } from "mime-types";
@@ -10,7 +11,7 @@ const stat_lock = new Lock();
 
 export const stat = cacheFn(async (filename: string) => {
 	const lock = await stat_lock.wait_and_lock();
-	const stats = await fs.promises.stat(filename).catch(() => undefined);
+	const stats = await fs.promises.lstat(filename).catch(() => undefined);
 
 	lock.unlock();
 
@@ -115,15 +116,17 @@ export async function process(filename: string): Promise<[string, URL]> {
 
 const transaction_lock = new Lock();
 
-export async function transaction(filename: string) {
+export async function transaction(filename: string, dry = true) {
 	const lock = await transaction_lock.wait_and_lock();
 
 	const [name, url] = await process(filename);
 	const directory = path.resolve(filename, "..");
 	const donfile = path.resolve(directory, "compacted.don");
+
 	const dondata = fs.existsSync(donfile)
 		? await fs.promises.readFile(donfile)
 		: "[]";
+
 	const donhash = await nsblob.store(dondata);
 	const don = DonNode.decode(String(dondata));
 
@@ -133,9 +136,8 @@ export async function transaction(filename: string) {
 	const new_dondata = don.fmt("\t") + "\n";
 	const new_donhash = await nsblob.store(new_dondata);
 
-	await fs.promises.writeFile(donfile, new_dondata);
-
-	if (filename !== donfile) {
+	if (filename !== donfile && !dry) {
+		await fs.promises.writeFile(donfile, new_dondata);
 		await fs.promises.rm(filename, { recursive: true });
 	}
 
@@ -144,20 +146,64 @@ export async function transaction(filename: string) {
 	return new_donhash;
 }
 
-export async function compact(dirname: string) {
+export async function processSymbolicLink(name: string, dry = true) {
+	const readlink = await fs.promises.readlink(name);
+	const real = path.resolve(name, "..", readlink);
+	const stats = await stat(real);
+
+	if (!stats) {
+		if (!dry) {
+			await fs.promises.unlink(name);
+			await fs.promises.writeFile(name, "Invalid symlink: " + readlink);
+		}
+
+		return;
+	}
+
+	const node = new DonNode([
+		["type", "symlink"],
+		["name", name],
+		["hash", await transaction(real, true)],
+		["target", readlink],
+	]);
+
+	const fmt = node.fmt("\t") + "\n";
+
+	const hash = await uploadBuffer(
+		Buffer.from(fmt),
+		name,
+		"text/plain",
+		stats.mtimeMs
+	);
+
+	if (!dry) {
+		await fs.promises.unlink(name);
+		await fs.promises.writeFile(name, fmt);
+	}
+
+	return hash;
+}
+
+export async function compact(dirname: string, dry = true) {
 	const entries = await readdir(dirname);
 
 	return await Promise.all(
 		entries.map(async (filename) => {
-			const stats = await stat(filename);
+			try {
+				const stats = await stat(filename);
 
-			if (stats?.isDirectory()) {
-				await compact(filename);
-			} else if (stats?.isFile()) {
-				preupload(filename);
+				if (stats?.isDirectory()) {
+					assert(await compact(filename, dry));
+				} else if (stats?.isFile()) {
+					preupload(filename);
+				} else if (stats?.isSymbolicLink()) {
+					await processSymbolicLink(filename, dry);
+				}
+
+				await transaction(filename, dry);
+			} catch {
+				return false;
 			}
-
-			await transaction(filename);
 		})
 	);
 }

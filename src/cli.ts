@@ -5,4 +5,4 @@ import path from "path";
 
 import { compact } from ".";
 
-compact(path.resolve(homedir(), "trash.d"));
+compact(path.resolve(homedir(), "trash.d"), false);
